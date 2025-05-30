@@ -6,6 +6,9 @@ import os
 import shutil
 import time
 from datetime import datetime
+import csv
+import threading
+from pathlib import Path
 
 # Third-party imports
 import tkinter as tk
@@ -35,6 +38,7 @@ available_wavelengths = set()
 experiment_finished = False
 project_name = ""
 output_path = ""
+raw_data_folder = ""  # New: folder where Golden Eye saves raw data
 
 # Device status
 tls_found = False
@@ -43,8 +47,17 @@ tls_device_address = None
 arduino_port = None
 trigger_string = 'trigger\n'
 
+# Acquisition monitoring
+acquisition_log = []  # New: tracks acquisition progress
+monitoring_thread = None  # New: thread for monitoring raw files
+stop_monitoring = False  # New: flag to stop monitoring
+current_acquisition_index = 0  # New: tracks current acquisition
+file_timeout = 60  # New: timeout in seconds for file creation
+last_file_time = None  # New: timestamp of last file creation
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
 
 # ------------------------------
 # 3. UTILITY FUNCTIONS
@@ -53,6 +66,209 @@ def sort_folders_by_modification(folders):
     folders_with_time = [(folder, os.path.getmtime(os.path.join(SAVED_IMAGES_DIRECTORY, folder))) for folder in folders]
     sorted_folders = sorted(folders_with_time, key=lambda x: x[1])
     return [folder[0] for folder in sorted_folders]
+
+
+def create_acquisition_log_file():
+    """Create a CSV log file for tracking acquisitions"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"acquisition_log_{project_name}_{timestamp}.csv"
+    log_path = os.path.join(output_path, log_filename)
+
+    with open(log_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Index', 'Wavelength', 'Picture_Number', 'Expected_Name',
+                         'Raw_Filename', 'Status', 'Timestamp', 'File_Size'])
+
+    return log_path
+
+
+def update_acquisition_log(log_path, index, wavelength, pic_num, expected_name,
+                           raw_filename='', status='pending', file_size=0):
+    """Update the acquisition log with new information"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Check if entry exists
+    existing_data = []
+    if os.path.exists(log_path):
+        with open(log_path, 'r', newline='') as csvfile:
+            reader = csv.reader(csvfile)
+            existing_data = list(reader)
+
+    # Update or append entry
+    entry_found = False
+    for i, row in enumerate(existing_data[1:], 1):  # Skip header
+        if len(row) > 0 and int(row[0]) == index:
+            existing_data[i] = [index, wavelength, pic_num, expected_name,
+                                raw_filename, status, timestamp, file_size]
+            entry_found = True
+            break
+
+    if not entry_found and existing_data:
+        existing_data.append([index, wavelength, pic_num, expected_name,
+                              raw_filename, status, timestamp, file_size])
+
+    # Write back to file
+    with open(log_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerows(existing_data)
+
+
+def monitor_raw_files():
+    """Monitor the raw data folder for new files"""
+    global stop_monitoring, last_file_time, current_acquisition_index
+
+    logging.info(f"Starting raw file monitoring in: {raw_data_folder}")
+
+    # Get initial list of files
+    initial_files = set(os.listdir(raw_data_folder)) if os.path.exists(raw_data_folder) else set()
+    last_file_time = time.time()
+
+    while not stop_monitoring:
+        try:
+            current_files = set(os.listdir(raw_data_folder))
+            new_files = current_files - initial_files
+
+            if new_files:
+                for new_file in new_files:
+                    if new_file.endswith('.bin'):
+                        file_path = os.path.join(raw_data_folder, new_file)
+                        file_size = os.path.getsize(file_path)
+
+                        logging.info(f"New raw file detected: {new_file} (size: {file_size} bytes)")
+
+                        # Update acquisition log
+                        if current_acquisition_index < len(acquisition_log):
+                            entry = acquisition_log[current_acquisition_index]
+                            update_acquisition_log(
+                                entry['log_path'],
+                                entry['index'],
+                                entry['wavelength'],
+                                entry['pic_num'],
+                                entry['expected_name'],
+                                new_file,
+                                'completed',
+                                file_size
+                            )
+
+                            # Update status label in UI
+                            update_status_label(f"Acquired: {entry['wavelength']}nm #{entry['pic_num']} -> {new_file}")
+
+                        last_file_time = time.time()
+                        initial_files = current_files
+
+            # Check for timeout
+            if time.time() - last_file_time > file_timeout:
+                logging.warning(f"File creation timeout! No new files for {file_timeout} seconds")
+
+                # Show warning dialog
+                root.after(0, lambda: messagebox.showwarning(
+                    "Acquisition Warning",
+                    f"No new files detected for {file_timeout} seconds.\n"
+                    "Camera may have stopped. Check Golden Eye software."
+                ))
+
+                # Update status for remaining acquisitions
+                for i in range(current_acquisition_index, len(acquisition_log)):
+                    entry = acquisition_log[i]
+                    update_acquisition_log(
+                        entry['log_path'],
+                        entry['index'],
+                        entry['wavelength'],
+                        entry['pic_num'],
+                        entry['expected_name'],
+                        '',
+                        'timeout',
+                        0
+                    )
+
+            time.sleep(2)  # Check every 2 seconds
+
+        except Exception as e:
+            logging.error(f"Error in file monitoring: {e}")
+            time.sleep(2)
+
+
+def update_status_label(message):
+    """Update the acquisition status label in the UI"""
+    if 'acquisition_status_label' in globals():
+        root.after(0, lambda: acquisition_status_label.config(text=message))
+
+
+def check_previous_acquisition():
+    """Check for previous incomplete acquisition logs"""
+    if not output_path or not os.path.exists(output_path):
+        return None
+
+    # Look for acquisition log files
+    log_files = [f for f in os.listdir(output_path) if f.startswith('acquisition_log_')]
+
+    if not log_files:
+        return None
+
+    # Get the most recent log file
+    latest_log = max(log_files, key=lambda f: os.path.getmtime(os.path.join(output_path, f)))
+    log_path = os.path.join(output_path, latest_log)
+
+    # Read the log and check for incomplete acquisitions
+    incomplete_count = 0
+    total_count = 0
+
+    with open(log_path, 'r', newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        rows = list(reader)
+        total_count = len(rows)
+        incomplete_count = sum(1 for row in rows if row['Status'] != 'completed')
+
+    if incomplete_count > 0:
+        return {
+            'log_path': log_path,
+            'total': total_count,
+            'incomplete': incomplete_count,
+            'completed': total_count - incomplete_count
+        }
+
+    return None
+
+
+def resume_from_log(log_path):
+    """Resume acquisition from a previous log file"""
+    global acquisition_log, current_acquisition_index
+
+    acquisition_log = []
+
+    with open(log_path, 'r', newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            if row['Status'] != 'completed':
+                acquisition_log.append({
+                    'index': int(row['Index']),
+                    'wavelength': row['Wavelength'],
+                    'pic_num': int(row['Picture_Number']),
+                    'expected_name': row['Expected_Name'],
+                    'log_path': log_path
+                })
+
+    current_acquisition_index = 0
+    logging.info(f"Resuming acquisition with {len(acquisition_log)} remaining items")
+
+
+def select_raw_data_folder():
+    """Prompt user to select the folder where Golden Eye saves raw data"""
+    global raw_data_folder
+
+    folder = filedialog.askdirectory(
+        title="Select Golden Eye Raw Data Folder",
+        initialdir=raw_data_folder if raw_data_folder else "C:\\"
+    )
+
+    if folder:
+        raw_data_folder = folder
+        raw_folder_label.config(text=f"Raw folder: {folder}")
+        logging.info(f"Raw data folder selected: {folder}")
+        check_device_status()
+    else:
+        messagebox.showwarning("Warning", "Raw data folder must be selected before starting acquisition")
+
 
 def load_folder():
     folder_path = filedialog.askdirectory()
@@ -174,6 +390,8 @@ def process_folder(folder_path):
 
     # Update the wavelength filter dropdown with the available wavelengths
     update_wavelength_filters()
+
+
 # ------------------------------
 # 4. DEVICE COMMUNICATION FUNCTIONS
 # ------------------------------
@@ -204,6 +422,7 @@ def check_tls_device():
         logging.error(f"Error accessing VISA resources: {e}")
         return False, None
 
+
 def check_arduino_device():
     try:
         ports = list(serial.tools.list_ports.comports())
@@ -225,6 +444,7 @@ def check_arduino_device():
         logging.error(f"Error accessing serial ports: {e}")
         return False, None
 
+
 def find_tls():
     global tls_found, tls_device_address
     tls_found, tls_device_address = check_tls_device()
@@ -236,6 +456,7 @@ def find_tls():
     else:
         tls_status_label.config(bg='red')
         messagebox.showerror("Error", "TLS device not found")
+
 
 def find_golden_eye():
     global golden_eye_found, arduino_port
@@ -249,9 +470,12 @@ def find_golden_eye():
         golden_eye_status_label.config(bg='red')
         messagebox.showerror("Error", "Golden Eye (Arduino) device not found")
 
+
 def check_device_status():
-    if tls_found and golden_eye_found:
+    if tls_found and golden_eye_found and raw_data_folder:
         execute_button.config(state='normal')
+        resume_button.config(state='normal')
+
 
 def send_trigger():
     baud_rate = 9600
@@ -260,17 +484,10 @@ def send_trigger():
         ser.write(trigger_string.encode('utf-8'))
         logging.info(f"Sent: {trigger_string.strip()}")
 
+
 # ------------------------------
 # 5. DATA PROCESSING FUNCTIONS
 # ------------------------------
-def load_and_display_cubes(folder_path):
-    folder_path = filedialog.askdirectory()
-
-    if folder_path:
-        logging.info(f"Folder selected: {folder_path}")
-        # Convert and display all the images found in the folder
-        load_and_display_cubes(folder_path)
-
 def sum_selected_cubes():
     if not selected_images:
         messagebox.showerror("Error", "No images selected for summing.")
@@ -304,6 +521,7 @@ def sum_selected_cubes():
         show_combined_image_popup(summed_rgb_image, combined_cube, first_hdr_metadata)
     else:
         messagebox.showerror("Error", "Could not sum the selected cubes.")
+
 
 def average_selected_cubes():
     if not selected_images:
@@ -344,6 +562,7 @@ def average_selected_cubes():
         show_averaged_image_popup(averaged_rgb_image, combined_cube, first_hdr_metadata)
     else:
         messagebox.showerror("Error", "Could not average the selected cubes.")
+
 
 def add_cubes_for_same_wavelength(folders):
     date_str = datetime.now().strftime("%m-%d")
@@ -386,6 +605,7 @@ def add_cubes_for_same_wavelength(folders):
         envi.save_image(output_hdr_file, combined_cube, metadata=first_hdr_metadata, force=True)
         logging.info(f"Saved combined cube for wavelength {wavelength} at {output_hdr_file}")
 
+
 def save_rgb(image_path):
     directory = filedialog.askdirectory()
     if not directory:
@@ -401,6 +621,7 @@ def save_rgb(image_path):
         logging.error(f"Failed to save RGB image: {e}")
         messagebox.showerror("Error", f"Failed to save RGB image: {e}")
 
+
 def save_rgb_image(image_path, default_filename):
     directory = filedialog.askdirectory()
     if not directory:
@@ -415,6 +636,7 @@ def save_rgb_image(image_path, default_filename):
     except Exception as e:
         logging.error(f"Failed to save RGB image: {e}")
         messagebox.showerror("Error", f"Failed to save RGB image: {e}")
+
 
 def save_cube(summed_cube, metadata):
     # Ask the user to select a directory to save the hyperspectral cube
@@ -433,6 +655,7 @@ def save_cube(summed_cube, metadata):
         logging.error(f"Failed to save hyperspectral cube: {e}")
         messagebox.showerror("Error", f"Failed to save hyperspectral cube: {e}")
 
+
 def save_averaged_cube(averaged_cube, metadata):
     directory = filedialog.askdirectory()
     if not directory:
@@ -448,31 +671,163 @@ def save_averaged_cube(averaged_cube, metadata):
         logging.error(f"Failed to save hyperspectral cube: {e}")
         messagebox.showerror("Error", f"Failed to save hyperspectral cube: {e}")
 
+
 # ------------------------------
 # 6. UI EVENT HANDLERS
 # ------------------------------
 def execute_commands():
-    global experiment_finished
+    global experiment_finished, acquisition_log, monitoring_thread, stop_monitoring
+    global current_acquisition_index, last_file_time
+
+    # Check if raw data folder is selected
+    if not raw_data_folder:
+        messagebox.showerror("Error", "Please select the Golden Eye raw data folder first!")
+        return
+
+    # Initialize acquisition tracking
+    acquisition_log = []
+    current_acquisition_index = 0
+    stop_monitoring = False
+
+    # Create log file
+    log_path = create_acquisition_log_file()
+
+    # Build acquisition plan
+    acquisition_index = 0
+    for child in tree.get_children():
+        wavelength = tree.item(child)["values"][0]
+        num_pictures = int(tree.item(child)["values"][1])
+
+        for i in range(1, num_pictures + 1):
+            expected_name = f"{project_name}_{wavelength}_{i}"
+            acquisition_log.append({
+                'index': acquisition_index,
+                'wavelength': wavelength,
+                'pic_num': i,
+                'expected_name': expected_name,
+                'log_path': log_path
+            })
+
+            # Pre-populate log file
+            update_acquisition_log(log_path, acquisition_index, wavelength, i,
+                                   expected_name, '', 'pending', 0)
+            acquisition_index += 1
+
+    # Start file monitoring thread
+    monitoring_thread = threading.Thread(target=monitor_raw_files, daemon=True)
+    monitoring_thread.start()
+
+    # Start acquisition
     rm = pyvisa.ResourceManager()
     device = rm.open_resource(tls_device_address)
     device.timeout = 6000
     take_snapshot()
 
-    for child in tree.get_children():
-        wavelength = tree.item(child)["values"][0]
-        num_pictures = tree.item(child)["values"][1]
+    # Execute acquisition commands
+    for entry in acquisition_log:
+        wavelength = entry['wavelength']
+        pic_num = entry['pic_num']
 
-        for i in range(num_pictures):
-            device.write(f'gowave {wavelength}')
-            logging.info(f"TLS Command Sent: gowave {wavelength}")
-            time.sleep(5)
+        device.write(f'gowave {wavelength}')
+        logging.info(f"TLS Command Sent: gowave {wavelength}")
+        time.sleep(5)
 
-            send_trigger()
-            logging.info("Arduino Triggered")
-            time.sleep(20)
+        send_trigger()
+        logging.info(f"Arduino Triggered for {wavelength}nm picture {pic_num}")
+
+        current_acquisition_index = entry['index']
+        time.sleep(20)  # Wait for acquisition
 
     experiment_finished = True
+    stop_monitoring = True
     process_button.config(state='normal')
+
+    # Final status update
+    update_status_label("Acquisition complete!")
+
+
+def resume_acquisition():
+    """Resume a previous incomplete acquisition"""
+    global output_path
+
+    # Ask user to select the project folder
+    folder = filedialog.askdirectory(title="Select Project Folder with Previous Acquisition")
+    if not folder:
+        return
+
+    output_path = folder
+
+    # Check for previous acquisition
+    prev_acq = check_previous_acquisition()
+
+    if not prev_acq:
+        messagebox.showinfo("No Previous Acquisition",
+                            "No incomplete acquisition found in the selected folder.")
+        return
+
+    # Show resume dialog
+    result = messagebox.askyesno(
+        "Resume Acquisition",
+        f"Found incomplete acquisition:\n"
+        f"Total: {prev_acq['total']} acquisitions\n"
+        f"Completed: {prev_acq['completed']}\n"
+        f"Remaining: {prev_acq['incomplete']}\n\n"
+        f"Resume from where it stopped?"
+    )
+
+    if result:
+        # Resume from log
+        resume_from_log(prev_acq['log_path'])
+
+        # Execute remaining acquisitions
+        execute_resumed_commands()
+
+
+def execute_resumed_commands():
+    """Execute commands for resumed acquisition"""
+    global experiment_finished, monitoring_thread, stop_monitoring
+    global current_acquisition_index, last_file_time
+
+    # Check if raw data folder is selected
+    if not raw_data_folder:
+        messagebox.showerror("Error", "Please select the Golden Eye raw data folder first!")
+        return
+
+    stop_monitoring = False
+
+    # Start file monitoring thread
+    monitoring_thread = threading.Thread(target=monitor_raw_files, daemon=True)
+    monitoring_thread.start()
+
+    # Start acquisition
+    rm = pyvisa.ResourceManager()
+    device = rm.open_resource(tls_device_address)
+    device.timeout = 6000
+
+    # Execute remaining acquisition commands
+    for i, entry in enumerate(acquisition_log):
+        wavelength = entry['wavelength']
+        pic_num = entry['pic_num']
+
+        update_status_label(f"Acquiring: {wavelength}nm #{pic_num} ({i + 1}/{len(acquisition_log)})")
+
+        device.write(f'gowave {wavelength}')
+        logging.info(f"TLS Command Sent: gowave {wavelength}")
+        time.sleep(5)
+
+        send_trigger()
+        logging.info(f"Arduino Triggered for {wavelength}nm picture {pic_num}")
+
+        current_acquisition_index = i
+        time.sleep(20)  # Wait for acquisition
+
+    experiment_finished = True
+    stop_monitoring = True
+    process_button.config(state='normal')
+
+    # Final status update
+    update_status_label("Resumed acquisition complete!")
+
 
 def process_results():
     if not experiment_finished:
@@ -493,7 +848,9 @@ def process_results():
         open_project_window(new_folders_sorted)
         add_cubes_for_same_wavelength(new_folders_sorted)
     else:
-        messagebox.showerror("Error", f"Expected {total_pictures} folders, but found {len(new_folders_sorted)} new folders.")
+        messagebox.showerror("Error",
+                             f"Expected {total_pictures} folders, but found {len(new_folders_sorted)} new folders.")
+
 
 def add_row():
     wavelength = wavelength_entry.get()
@@ -510,6 +867,7 @@ def add_row():
     # Clear entry fields after adding
     wavelength_entry.delete(0, tk.END)
     pictures_entry.delete(0, tk.END)
+
 
 def edit_selected_row():
     """Edit the currently selected row"""
@@ -559,6 +917,7 @@ def edit_selected_row():
 
     save_button = tk.Button(edit_dialog, text="Save", command=save_changes)
     save_button.pack(pady=10)
+
 
 def delete_selected_row():
     """Delete the currently selected row"""
@@ -729,6 +1088,7 @@ def view_selected_cubes():
     y = (popup.winfo_screenheight() // 2) - (height // 2)
     popup.geometry(f"{width}x{height}+{x}+{y}")
 
+
 def select_by_wavelength():
     wavelength = wavelength_select_combobox.get()
 
@@ -830,6 +1190,7 @@ def update_selection_ui():
                 current_column = 0
                 current_row += 1
 
+
 def update_wavelength_filters():
     sorted_wavelengths = sorted(list(available_wavelengths))
 
@@ -840,6 +1201,7 @@ def update_wavelength_filters():
     # Update the selection dropdown
     wavelength_select_combobox['values'] = ['Select Wavelength'] + sorted_wavelengths
     wavelength_select_combobox.set('Select Wavelength')  # Set default
+
 
 def show_combined_image_popup(image_path, summed_cube, metadata):
     popup = tk.Toplevel(root)
@@ -866,6 +1228,7 @@ def show_combined_image_popup(image_path, summed_cube, metadata):
     popup.transient(root)
     popup.grab_set()
     root.wait_window(popup)
+
 
 def show_averaged_image_popup(image_path, averaged_cube, metadata):
     popup = tk.Toplevel(root)
@@ -939,7 +1302,6 @@ def open_project_window(new_folders_sorted):
 
     tk.Button(project_window, text="Save", command=save_project_info).pack(pady=10)
 
-# Function implementation...
 
 def rename_and_copy_folders(new_folders_sorted):
     date_str = datetime.now().strftime("%m-%d")
@@ -961,6 +1323,7 @@ def rename_and_copy_folders(new_folders_sorted):
 
     messagebox.showinfo("Success", "Folders copied and renamed successfully!")
 
+
 # ------------------------------
 # 7. UI SETUP AND INITIALIZATION
 # ------------------------------
@@ -970,6 +1333,7 @@ def create_right_click_menu():
     menu.add_command(label="Edit Row", command=edit_selected_row)
     menu.add_command(label="Delete Row", command=delete_selected_row)
     return menu
+
 
 def show_popup_menu(event):
     """Show the context menu on right-click"""
@@ -983,12 +1347,13 @@ def show_popup_menu(event):
     except Exception as e:
         logging.error(f"Error showing popup menu: {e}")
 
+
 def setup_acquisition_tab(acquisition_frame):
     """Set up the Acquisition tab with all its components"""
     global tree, wavelength_entry, pictures_entry
     global tls_status_label, golden_eye_status_label
     global execute_button, process_button, find_tls_button, find_golden_eye_button
-    global right_click_menu
+    global right_click_menu, raw_folder_label, acquisition_status_label, resume_button
 
     # Set up the treeview for wavelength and number of pictures
     columns = ("Wavelength", "Number of Pictures")
@@ -1019,6 +1384,18 @@ def setup_acquisition_tab(acquisition_frame):
     golden_eye_status_label = tk.Label(device_frame, text="   ", bg='red', width=2)
     golden_eye_status_label.pack(side=tk.LEFT, padx=5)
 
+    # Raw data folder selection
+    raw_folder_frame = tk.Frame(acquisition_frame)
+    raw_folder_frame.pack(pady=10)
+
+    select_raw_button = tk.Button(raw_folder_frame, text="Select Raw Data Folder",
+                                  command=select_raw_data_folder)
+    select_raw_button.pack(side=tk.LEFT, padx=5)
+
+    raw_folder_label = tk.Label(raw_folder_frame, text="Raw folder: Not selected",
+                                relief=tk.SUNKEN, width=50)
+    raw_folder_label.pack(side=tk.LEFT, padx=5)
+
     # Input frame for wavelength and number of pictures
     input_frame = tk.Frame(acquisition_frame)
     input_frame.pack(fill=tk.X)
@@ -1037,11 +1414,26 @@ def setup_acquisition_tab(acquisition_frame):
     add_button = tk.Button(input_frame, text="Add Row", command=add_row)
     add_button.pack(side=tk.LEFT, padx=5, pady=5)
 
-    # Execute and process buttons
-    execute_button = tk.Button(acquisition_frame, text="Execute Commands", command=execute_commands, state='disabled')
-    execute_button.pack(pady=10)
-    process_button = tk.Button(acquisition_frame, text="Process Results", command=process_results, state='disabled')
-    process_button.pack(pady=10)
+    # Acquisition status label
+    acquisition_status_label = tk.Label(acquisition_frame, text="Ready to start acquisition",
+                                        relief=tk.SUNKEN, height=2)
+    acquisition_status_label.pack(fill=tk.X, padx=10, pady=5)
+
+    # Execute, resume, and process buttons
+    button_frame = tk.Frame(acquisition_frame)
+    button_frame.pack(pady=10)
+
+    execute_button = tk.Button(button_frame, text="Execute Commands",
+                               command=execute_commands, state='disabled')
+    execute_button.pack(side=tk.LEFT, padx=5)
+
+    resume_button = tk.Button(button_frame, text="Resume Previous",
+                              command=resume_acquisition, state='disabled')
+    resume_button.pack(side=tk.LEFT, padx=5)
+
+    process_button = tk.Button(button_frame, text="Process Results",
+                               command=process_results, state='disabled')
+    process_button.pack(side=tk.LEFT, padx=5)
 
 
 def setup_processing_tab(processing_frame):
@@ -1134,6 +1526,7 @@ def setup_processing_tab(processing_frame):
 
     view_selected_button = tk.Button(button_frame, text="View Selected", command=view_selected_cubes, state="disabled")
     view_selected_button.pack(side=tk.LEFT, padx=10)
+
 
 def resize_canvas(event):
     canvas.configure(scrollregion=canvas.bbox("all"))
