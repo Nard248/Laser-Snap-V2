@@ -49,11 +49,8 @@ trigger_string = 'trigger\n'
 
 # Acquisition monitoring
 acquisition_log = []  # New: tracks acquisition progress
-monitoring_thread = None  # New: thread for monitoring raw files
-stop_monitoring = False  # New: flag to stop monitoring
-current_acquisition_index = 0  # New: tracks current acquisition
 file_timeout = 60  # New: timeout in seconds for file creation
-last_file_time = None  # New: timestamp of last file creation
+acquisition_log_path = ""  # New: path to current acquisition log
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -77,14 +74,15 @@ def create_acquisition_log_file():
     with open(log_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['Index', 'Wavelength', 'Picture_Number', 'Expected_Name',
-                         'Raw_Filename', 'Status', 'Timestamp', 'File_Size'])
+                         'Raw_Filename', 'Status', 'Timestamp', 'File_Size_Bytes'])
 
     return log_path
 
 
 def update_acquisition_log(log_path, index, wavelength, pic_num, expected_name,
                            raw_filename='', status='pending', file_size=0):
-    """Update the acquisition log with new information"""
+    """Update the acquisition log with new information
+    Status can be: pending, completed, timeout, cancelled"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # Check if entry exists
@@ -113,79 +111,47 @@ def update_acquisition_log(log_path, index, wavelength, pic_num, expected_name,
         writer.writerows(existing_data)
 
 
-def monitor_raw_files():
-    """Monitor the raw data folder for new files"""
-    global stop_monitoring, last_file_time, current_acquisition_index
-
-    logging.info(f"Starting raw file monitoring in: {raw_data_folder}")
+def wait_for_new_file(timeout_seconds=60):
+    """Wait for a new file to be created in the raw data folder"""
+    if not raw_data_folder or not os.path.exists(raw_data_folder):
+        logging.error("Raw data folder not set or doesn't exist")
+        return None
 
     # Get initial list of files
-    initial_files = set(os.listdir(raw_data_folder)) if os.path.exists(raw_data_folder) else set()
-    last_file_time = time.time()
+    initial_files = set(os.listdir(raw_data_folder))
+    start_time = time.time()
 
-    while not stop_monitoring:
+    logging.info(f"Waiting for new file in {raw_data_folder}...")
+
+    while time.time() - start_time < timeout_seconds:
         try:
             current_files = set(os.listdir(raw_data_folder))
             new_files = current_files - initial_files
 
-            if new_files:
-                for new_file in new_files:
-                    if new_file.endswith('.bin'):
-                        file_path = os.path.join(raw_data_folder, new_file)
-                        file_size = os.path.getsize(file_path)
+            # Look for new .bin files
+            for new_file in new_files:
+                if new_file.endswith('.bin'):
+                    file_path = os.path.join(raw_data_folder, new_file)
+                    file_size = os.path.getsize(file_path)
 
-                        logging.info(f"New raw file detected: {new_file} (size: {file_size} bytes)")
+                    # Wait a bit to ensure file is fully written
+                    time.sleep(2)
 
-                        # Update acquisition log
-                        if current_acquisition_index < len(acquisition_log):
-                            entry = acquisition_log[current_acquisition_index]
-                            update_acquisition_log(
-                                entry['log_path'],
-                                entry['index'],
-                                entry['wavelength'],
-                                entry['pic_num'],
-                                entry['expected_name'],
-                                new_file,
-                                'completed',
-                                file_size
-                            )
+                    # Check if file size is stable
+                    new_size = os.path.getsize(file_path)
+                    if new_size == file_size and file_size > 0:
+                        logging.info(f"New file detected: {new_file} (size: {file_size} bytes)")
+                        return new_file
 
-                            # Update status label in UI
-                            update_status_label(f"Acquired: {entry['wavelength']}nm #{entry['pic_num']} -> {new_file}")
-
-                        last_file_time = time.time()
-                        initial_files = current_files
-
-            # Check for timeout
-            if time.time() - last_file_time > file_timeout:
-                logging.warning(f"File creation timeout! No new files for {file_timeout} seconds")
-
-                # Show warning dialog
-                root.after(0, lambda: messagebox.showwarning(
-                    "Acquisition Warning",
-                    f"No new files detected for {file_timeout} seconds.\n"
-                    "Camera may have stopped. Check Golden Eye software."
-                ))
-
-                # Update status for remaining acquisitions
-                for i in range(current_acquisition_index, len(acquisition_log)):
-                    entry = acquisition_log[i]
-                    update_acquisition_log(
-                        entry['log_path'],
-                        entry['index'],
-                        entry['wavelength'],
-                        entry['pic_num'],
-                        entry['expected_name'],
-                        '',
-                        'timeout',
-                        0
-                    )
-
-            time.sleep(2)  # Check every 2 seconds
+            time.sleep(1)  # Check every second
 
         except Exception as e:
-            logging.error(f"Error in file monitoring: {e}")
-            time.sleep(2)
+            logging.error(f"Error checking for new files: {e}")
+            time.sleep(1)
+
+    # Timeout reached
+    logging.warning(f"Timeout: No new file detected in {timeout_seconds} seconds")
+    return None
 
 
 def update_status_label(message):
@@ -194,62 +160,49 @@ def update_status_label(message):
         root.after(0, lambda: acquisition_status_label.config(text=message))
 
 
-def check_previous_acquisition():
-    """Check for previous incomplete acquisition logs"""
-    if not output_path or not os.path.exists(output_path):
-        return None
+def load_acquisition_from_csv():
+    """Load incomplete acquisitions from a CSV file and populate the grid"""
+    # Ask user to select CSV file
+    csv_file = filedialog.askopenfilename(
+        title="Select Acquisition Log CSV",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+    )
 
-    # Look for acquisition log files
-    log_files = [f for f in os.listdir(output_path) if f.startswith('acquisition_log_')]
+    if not csv_file:
+        return
 
-    if not log_files:
-        return None
+    try:
+        # Clear existing rows in the tree
+        for item in tree.get_children():
+            tree.delete(item)
 
-    # Get the most recent log file
-    latest_log = max(log_files, key=lambda f: os.path.getmtime(os.path.join(output_path, f)))
-    log_path = os.path.join(output_path, latest_log)
+        # Read CSV and group by wavelength
+        wavelength_dict = {}
 
-    # Read the log and check for incomplete acquisitions
-    incomplete_count = 0
-    total_count = 0
+        with open(csv_file, 'r', newline='') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                # Only load acquisitions that are not completed (pending, timeout, or cancelled)
+                if row['Status'] in ['pending', 'timeout', 'cancelled']:
+                    wavelength = row['Wavelength']
+                    if wavelength not in wavelength_dict:
+                        wavelength_dict[wavelength] = 0
+                    wavelength_dict[wavelength] += 1
 
-    with open(log_path, 'r', newline='') as csvfile:
-        reader = csv.DictReader(csvfile)
-        rows = list(reader)
-        total_count = len(rows)
-        incomplete_count = sum(1 for row in rows if row['Status'] != 'completed')
+        # Populate the tree with grouped data
+        if wavelength_dict:
+            for wavelength, count in wavelength_dict.items():
+                tree.insert("", "end", values=(wavelength, count))
 
-    if incomplete_count > 0:
-        return {
-            'log_path': log_path,
-            'total': total_count,
-            'incomplete': incomplete_count,
-            'completed': total_count - incomplete_count
-        }
+            messagebox.showinfo("Success",
+                                f"Loaded {sum(wavelength_dict.values())} incomplete acquisitions from {len(wavelength_dict)} wavelengths")
+        else:
+            messagebox.showinfo("No Incomplete Acquisitions",
+                                "All acquisitions in the selected file are completed.")
 
-    return None
-
-
-def resume_from_log(log_path):
-    """Resume acquisition from a previous log file"""
-    global acquisition_log, current_acquisition_index
-
-    acquisition_log = []
-
-    with open(log_path, 'r', newline='') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            if row['Status'] != 'completed':
-                acquisition_log.append({
-                    'index': int(row['Index']),
-                    'wavelength': row['Wavelength'],
-                    'pic_num': int(row['Picture_Number']),
-                    'expected_name': row['Expected_Name'],
-                    'log_path': log_path
-                })
-
-    current_acquisition_index = 0
-    logging.info(f"Resuming acquisition with {len(acquisition_log)} remaining items")
+    except Exception as e:
+        logging.error(f"Error loading CSV file: {e}")
+        messagebox.showerror("Error", f"Failed to load CSV file: {str(e)}")
 
 
 def select_raw_data_folder():
@@ -474,7 +427,7 @@ def find_golden_eye():
 def check_device_status():
     if tls_found and golden_eye_found and raw_data_folder:
         execute_button.config(state='normal')
-        resume_button.config(state='normal')
+        load_csv_button.config(state='normal')
 
 
 def send_trigger():
@@ -676,23 +629,69 @@ def save_averaged_cube(averaged_cube, metadata):
 # 6. UI EVENT HANDLERS
 # ------------------------------
 def execute_commands():
-    global experiment_finished, acquisition_log, monitoring_thread, stop_monitoring
-    global current_acquisition_index, last_file_time
+    global experiment_finished, acquisition_log, acquisition_log_path, project_name, output_path
 
     # Check if raw data folder is selected
     if not raw_data_folder:
         messagebox.showerror("Error", "Please select the Golden Eye raw data folder first!")
         return
 
+    # Check if project name and output path are set
+    if not project_name or not output_path:
+        # Create a simple dialog to get project info
+        dialog = tk.Toplevel(root)
+        dialog.title("Project Information")
+        dialog.geometry("400x200")
+        dialog.transient(root)
+        dialog.grab_set()
+
+        tk.Label(dialog, text="Project Name:").pack(pady=5)
+        name_entry = tk.Entry(dialog, width=40)
+        name_entry.pack(pady=5)
+
+        tk.Label(dialog, text="Output Path:").pack(pady=5)
+        path_label = tk.Label(dialog, text="No folder selected", relief=tk.SUNKEN, width=40)
+        path_label.pack(pady=5)
+
+        def select_folder():
+            folder = filedialog.askdirectory()
+            if folder:
+                path_label.config(text=folder)
+                dialog.selected_path = folder
+
+        dialog.selected_path = ""
+        tk.Button(dialog, text="Browse", command=select_folder).pack(pady=5)
+
+        def save_and_continue():
+            global project_name, output_path
+            project_name = name_entry.get()
+            output_path = dialog.selected_path
+
+            if not project_name or not output_path:
+                messagebox.showerror("Error", "Both project name and output path are required!")
+                return
+
+            if not os.path.exists(output_path):
+                os.makedirs(output_path)
+
+            dialog.destroy()
+
+        tk.Button(dialog, text="Continue", command=save_and_continue).pack(pady=10)
+
+        # Wait for dialog to close
+        root.wait_window(dialog)
+
+        # Check again if values were set
+        if not project_name or not output_path:
+            return
+
     # Initialize acquisition tracking
     acquisition_log = []
-    current_acquisition_index = 0
-    stop_monitoring = False
 
     # Create log file
-    log_path = create_acquisition_log_file()
+    acquisition_log_path = create_acquisition_log_file()
 
-    # Build acquisition plan
+    # Build acquisition plan and pre-populate log
     acquisition_index = 0
     for child in tree.get_children():
         wavelength = tree.item(child)["values"][0]
@@ -704,18 +703,13 @@ def execute_commands():
                 'index': acquisition_index,
                 'wavelength': wavelength,
                 'pic_num': i,
-                'expected_name': expected_name,
-                'log_path': log_path
+                'expected_name': expected_name
             })
 
             # Pre-populate log file
-            update_acquisition_log(log_path, acquisition_index, wavelength, i,
+            update_acquisition_log(acquisition_log_path, acquisition_index, wavelength, i,
                                    expected_name, '', 'pending', 0)
             acquisition_index += 1
-
-    # Start file monitoring thread
-    monitoring_thread = threading.Thread(target=monitor_raw_files, daemon=True)
-    monitoring_thread.start()
 
     # Start acquisition
     rm = pyvisa.ResourceManager()
@@ -723,23 +717,80 @@ def execute_commands():
     device.timeout = 6000
     take_snapshot()
 
-    # Execute acquisition commands
+    # Execute acquisition commands sequentially
     for entry in acquisition_log:
         wavelength = entry['wavelength']
         pic_num = entry['pic_num']
+        index = entry['index']
 
+        # Update status
+        update_status_label(f"Acquiring: {wavelength}nm #{pic_num} ({index + 1}/{len(acquisition_log)})")
+
+        # Send wavelength command
         device.write(f'gowave {wavelength}')
         logging.info(f"TLS Command Sent: gowave {wavelength}")
         time.sleep(5)
 
+        # Send trigger
         send_trigger()
         logging.info(f"Arduino Triggered for {wavelength}nm picture {pic_num}")
 
-        current_acquisition_index = entry['index']
-        time.sleep(20)  # Wait for acquisition
+        # Wait for the new file
+        new_file = wait_for_new_file(file_timeout)
+
+        if new_file:
+            # Update log with successful acquisition
+            file_path = os.path.join(raw_data_folder, new_file)
+            file_size = os.path.getsize(file_path)
+
+            update_acquisition_log(
+                acquisition_log_path,
+                index,
+                wavelength,
+                pic_num,
+                entry['expected_name'],
+                new_file,
+                'completed',
+                file_size
+            )
+
+            update_status_label(f"Completed: {wavelength}nm #{pic_num} -> {new_file}")
+        else:
+            # Timeout occurred
+            update_acquisition_log(
+                acquisition_log_path,
+                index,
+                wavelength,
+                pic_num,
+                entry['expected_name'],
+                '',
+                'timeout',
+                0
+            )
+
+            # Ask user if they want to continue
+            result = messagebox.askyesno(
+                "Acquisition Timeout",
+                f"No file detected for {wavelength}nm #{pic_num}.\n"
+                f"Do you want to continue with the next acquisition?"
+            )
+
+            if not result:
+                # Mark remaining as cancelled
+                for remaining_entry in acquisition_log[index + 1:]:
+                    update_acquisition_log(
+                        acquisition_log_path,
+                        remaining_entry['index'],
+                        remaining_entry['wavelength'],
+                        remaining_entry['pic_num'],
+                        remaining_entry['expected_name'],
+                        '',
+                        'cancelled',
+                        0
+                    )
+                break
 
     experiment_finished = True
-    stop_monitoring = True
     process_button.config(state='normal')
 
     # Final status update
@@ -1274,11 +1325,13 @@ def open_project_window(new_folders_sorted):
 
     def save_project_info():
         global project_name, output_path
-        project_name = project_name_entry.get()
+        temp_project_name = project_name_entry.get()
 
-        if not project_name or not output_path:
+        if not temp_project_name or not output_path:
             messagebox.showerror("Error", "Please provide both project name and output path.")
             return
+
+        project_name = temp_project_name  # Set project_name before using it
 
         if not os.path.exists(output_path):
             os.makedirs(output_path)
@@ -1353,7 +1406,7 @@ def setup_acquisition_tab(acquisition_frame):
     global tree, wavelength_entry, pictures_entry
     global tls_status_label, golden_eye_status_label
     global execute_button, process_button, find_tls_button, find_golden_eye_button
-    global right_click_menu, raw_folder_label, acquisition_status_label, resume_button
+    global right_click_menu, raw_folder_label, acquisition_status_label, load_csv_button
 
     # Set up the treeview for wavelength and number of pictures
     columns = ("Wavelength", "Number of Pictures")
@@ -1419,7 +1472,7 @@ def setup_acquisition_tab(acquisition_frame):
                                         relief=tk.SUNKEN, height=2)
     acquisition_status_label.pack(fill=tk.X, padx=10, pady=5)
 
-    # Execute, resume, and process buttons
+    # Execute, load CSV, and process buttons
     button_frame = tk.Frame(acquisition_frame)
     button_frame.pack(pady=10)
 
@@ -1427,9 +1480,9 @@ def setup_acquisition_tab(acquisition_frame):
                                command=execute_commands, state='disabled')
     execute_button.pack(side=tk.LEFT, padx=5)
 
-    resume_button = tk.Button(button_frame, text="Resume Previous",
-                              command=resume_acquisition, state='disabled')
-    resume_button.pack(side=tk.LEFT, padx=5)
+    load_csv_button = tk.Button(button_frame, text="Load from CSV",
+                                command=load_acquisition_from_csv, state='disabled')
+    load_csv_button.pack(side=tk.LEFT, padx=5)
 
     process_button = tk.Button(button_frame, text="Process Results",
                                command=process_results, state='disabled')
